@@ -17,7 +17,7 @@ import os
 from datetime import datetime, timedelta
 import calendar
 from pathlib import Path
-from typing import List, Dict, Set, Tuple
+from typing import List, Dict, Set, Tuple, Any, Optional
 from urllib.parse import urlparse
 from bs4 import BeautifulSoup
 import xml.etree.ElementTree as ET
@@ -735,6 +735,152 @@ def generate_report(input_csv: str, output_file: str):
 
     print(f"Report generated: {output_file}")
 
+def _safe_parse_json_block(resp: str) -> Optional[dict]:
+    try:
+        start = resp.find("{")
+        end = resp.rfind("}") + 1
+        if start >= 0 and end > start:
+            return json.loads(resp[start:end])
+    except Exception:
+        pass
+    return None
+
+def _write_text_report(structured: Dict[str, Any], out_path: Path) -> None:
+    with open(out_path, 'w', encoding='utf-8') as f:
+        for category in structured.get("categories", {}):
+            f.write(f"{category}\n\n")
+            for item in structured["categories"][category]:
+                title = item.get("title", "No title")
+                summary = item.get("summary", "No summary")
+                sources = item.get("sources", [])
+                src_line = "Source: " + ", ".join(sources) if sources else "Source: N/A"
+                f.write(f"{title}\n{summary}\n{src_line}\n\n")
+            f.write("\n")
+
+def _write_html_report(structured: Dict[str, Any], out_path: Path) -> None:
+    def esc(t: str) -> str:
+        return (t or "").replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
+    html_parts = []
+    html_parts.append("""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<title>Threat Intelligence Report</title>
+<style>
+body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;margin:20px;color:#111}
+h1{font-size:24px;margin:0 0 12px}
+h2{font-size:20px;margin:24px 0 12px;border-bottom:1px solid #ddd;padding-bottom:6px}
+.article{margin:14px 0 18px}
+.title{font-weight:600;margin-bottom:6px}
+.summary{margin:4px 0 6px}
+.sources a{color:#0645AD;text-decoration:none}
+.sources a:hover{text-decoration:underline}
+</style>
+</head>
+<body>
+<h1>Threat Intelligence Report</h1>
+""")
+    for category in structured.get("categories", {}):
+        html_parts.append(f"<h2>{esc(category)}</h2>")
+        for item in structured["categories"][category]:
+            title = esc(item.get("title", "No title"))
+            summary = esc(item.get("summary", "No summary"))
+            links = item.get("sources", [])
+            links_html = ", ".join(f'<a href="{esc(u)}" target="_blank" rel="noopener noreferrer">{esc(u)}</a>' for u in links)
+            html_parts.append(f'<div class="article"><div class="title">{title}</div>')
+            html_parts.append(f'<div class="summary">{summary}</div>')
+            html_parts.append(f'<div class="sources"><strong>Source:</strong> {links_html if links_html else "N/A"}</div></div>')
+    html_parts.append("</body></html>")
+    out_path.write_text("\n".join(html_parts), encoding="utf-8")
+
+def _fallback_structured_from_text(report_text: str) -> Dict[str, Any]:
+    # Minimal parser: split by category headers and group items by blank lines
+    categories = ["Critical – Vulnerabilities", "Malware/Ransomware Threats"]
+    current_cat = None
+    structured: Dict[str, Any] = {"categories": {c: [] for c in categories}}
+    buf: list[str] = []
+
+    def flush_buf():
+        nonlocal buf, current_cat
+        if current_cat and buf:
+            # Expect: title, summary, Source: ...
+            title = buf[0].strip() if len(buf) > 0 else "Untitled"
+            summary = buf[1].strip() if len(buf) > 1 else ""
+            sources = []
+            for line in buf:
+                if line.strip().lower().startswith("source:"):
+                    part = line.split(":", 1)[1].strip()
+                    sources = [s.strip() for s in part.split(",") if s.strip()]
+                    break
+            structured["categories"][current_cat].append({"title": title, "summary": summary, "sources": sources})
+            buf = []
+
+    for line in report_text.splitlines():
+        if line.strip() in categories:
+            flush_buf()
+            current_cat = line.strip()
+            continue
+        if not line.strip():
+            flush_buf()
+        else:
+            buf.append(line)
+    flush_buf()
+    return structured
+
+def postprocess_report_with_llm(text_report_path: Path) -> Tuple[Optional[Path], Optional[Path]]:
+    """
+    Send threat_intel_report.txt to the LLM to:
+    1) Deduplicate items by title/summary, merging links into 'sources'.
+    2) Produce an HTML report with clickable links.
+    Returns (dedup_text_path, html_path).
+    """
+    raw = text_report_path.read_text(encoding="utf-8", errors="ignore")
+    prompt = f"""You are given a threat intelligence report with two categories:
+- "Critical – Vulnerabilities"
+- "Malware/Ransomware Threats"
+
+Each item is formatted as:
+Title
+Summary
+Source: <link1>[, <link2>, ...]
+
+Task:
+1) Identify duplicates (same or highly similar title/summary). Keep one item and merge all links into a single sources list.
+2) Return a single JSON object with structure exactly:
+{{
+  "categories": {{
+    "Critical – Vulnerabilities": [{{"title": "...","summary": "...","sources": ["...", "..."]}} ],
+    "Malware/Ransomware Threats": [{{"title": "...","summary": "...","sources": ["...", "..."]}} ]
+  }}
+}}
+
+Here is the report to process:
+
+{raw}
+"""
+    try:
+        resp = query_local_llm(prompt)
+        data = _safe_parse_json_block(resp)
+        if not data or "categories" not in data:
+            raise ValueError("LLM did not return expected JSON")
+        # Write outputs next to source file
+        dedup_txt = text_report_path.with_name("threat_intel_report_dedup.txt")
+        html_out = text_report_path.with_name("threat_intel_report.html")
+        _write_text_report(data, dedup_txt)
+        _write_html_report(data, html_out)
+        logger.info(f"LLM post-process complete: {dedup_txt.name}, {html_out.name}")
+        return dedup_txt, html_out
+    except Exception as e:
+        logger.warning(f"LLM post-process failed ({e}); generating basic HTML without extra dedupe")
+        # Fallback: parse the original text into structured and write HTML + copy text
+        data = _fallback_structured_from_text(raw)
+        dedup_txt = text_report_path.with_name("threat_intel_report_dedup.txt")
+        html_out = text_report_path.with_name("threat_intel_report.html")
+        # Reuse same structure (minimal dedupe)
+        _write_text_report(data, dedup_txt)
+        _write_html_report(data, html_out)
+        return dedup_txt, html_out
+
 async def main():
     """Main function"""
     parser = argparse.ArgumentParser(description="Threat Intelligence RSS Feed Analyzer")
@@ -792,6 +938,13 @@ async def main():
         output_report_path = input_csv_path.parent / report_name
         generate_report(str(input_csv_path), str(output_report_path))
         logger.info(f"Report saved to {output_report_path}")
+
+        # NEW: Send the text report to LLM to dedupe again and produce HTML with clickable links
+        dedup_txt, html_out = postprocess_report_with_llm(output_report_path)
+        if dedup_txt:
+            logger.info(f"Deduplicated text report: {dedup_txt}")
+        if html_out:
+            logger.info(f"HTML report: {html_out}")
 
     logger.info("Main function execution completed.")
 
